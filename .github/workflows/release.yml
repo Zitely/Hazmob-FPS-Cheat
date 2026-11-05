@@ -1,0 +1,43 @@
+name: Publish Windows update
+on:
+  push:
+    branches: [main]
+    paths:
+      - version.txt
+      - .github/workflows/release.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: publish-windows-update
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test updater and targeting
+        run: python -m unittest discover -s tests -v
+      - name: Build release packages
+        run: python tools/build_release.py
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r\n' < version.txt)
+          tag="v$version"
+          if gh release view "$tag" --json isDraft > release-state.json 2>/dev/null; then
+            if [ "$(python -c 'import json; print(json.load(open("release-state.json"))["isDraft"])')" = "False" ]; then
+              echo "Release already published. Increment version.txt for a new update."
+              exit 0
+            fi
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --draft --target "$GITHUB_SHA" --title "Hazmob Snap $version" --notes "Download HazmobSnap-Windows.zip for installation. Existing GitHub-connected installations update when restarted. Gameplay detection and aiming remain experimental."
+          fi
+          gh release edit "$tag" --draft=false --latest

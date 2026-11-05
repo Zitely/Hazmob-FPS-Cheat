@@ -1,0 +1,10 @@
+.venv/
+.releases/
+.model-settings/
+__pycache__/
+*.pyc
+*.pt
+*.onnx
+installed-versions.txt
+active-release.json*
+dist/
