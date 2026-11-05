@@ -1,38 +1,41 @@
 # Hazmob Snap — experimental head-keypoint aimbot
 
-## What's different
-- Automatic head snapping after you arm it with F8; no RMB requirement by default.
-- Uses YOLO11n-pose nose, eye and ear keypoints. At least two confident keypoints must lie in the upper portion of a detected person's box.
-- Targets the nearest eligible head point inside the selection radius.
-- Does not estimate head position from a plain body box when head keypoints are unavailable.
-- Removed the previous low-gain smoothing and 12-count movement limit. Default snap gain is 1.0, with a maximum 240 relative mouse counts per update.
-- F8 pauses/resumes. F9 exits. Focus loss stops input.
+## Version 1.3.0
+- Aimbot has one on/off toggle. There are no sensitivity, gain, confidence, or targeting sliders.
+- Targets must match across three frames before movement begins. A persistent lock resists switching to a different player just because that player becomes closer to the crosshair.
+- Missing and ambiguous targets produce no aiming movement. Reacquisition has a short cooldown.
+- Bounded corrections replace the previous 240-count jumps. Per-axis damping reduces response when the crosshair overshoots. A four-pixel settling zone avoids constant jitter.
+- Player ESP is now a transparent, click-through overlay on the game monitor, with separate skeleton, head marker, target circle and crosshair toggles.
+- The overlay excludes itself from screen capture so its drawings are not fed back into the detector. If Windows cannot exclude it, overlay display is disabled.
+- The version appears in the bottom-right corner of the app and overlay.
 
-## Launch
-Extract all files and run Start.cmd. First setup asks before downloading the CPU AI runtime and dependencies (several hundred MB). It requires Python 3.10–3.13 with tkinter; the launcher can use Codex's bundled Python. Otherwise install 64-bit Python 3.12 from https://www.python.org/downloads/windows/.
+## Run
+Extract the latest Windows release and run Start.cmd. The model loads automatically. Turn on Aimbot or Player ESP and return to Hazmob running full-screen in Chrome. F8 pauses/resumes all features; F9 exits. There is no requirement to hold RMB for aiming. Firing remains manual.
 
-For an existing installation, extract the full release ZIP over the application files to adopt the GitHub updater; keep your .venv and model files. Close the old version first. Do not run both simultaneously.
+On first setup the launcher asks before installing dependencies (several hundred MB); the pose model is downloaded when first loaded. Model weights and dependencies are reused on updates. Close old copies before starting a new version.
 
-Click Load detector. First load downloads yolo11n-pose.pt. Open Hazmob full-screen using the game's fullscreen button in Chrome. Press F8 to activate automatic snapping. Snap aiming is enabled by default but the application starts paused. Shots are still manual. Enable Require RMB if you want hold-to-aim behavior. Uncheck Snap aiming to inspect detections without moving the mouse.
-
-## Calibration
-Screen pixels and mouse-input counts are not the same unit. A gain of 1.0 is a starting point, not a calibrated one-frame headshot guarantee. Reduce Snap sensitivity if it overshoots; increase it if it undershoots. Tune while using one consistent game sensitivity. The next detection corrects the remaining error, so snapping may take several frames. The target radius controls how far from the center an eligible head can be selected.
-
-Head keypoint confidence controls how certain facial/ear landmarks must be. Low confidence can create false targets; high confidence may reject small or stylized heads. The preview marks head candidates in purple and the selected point in orange.
+## Feature toggles
+- Aimbot: track a confirmed visible head with fixed internal defaults.
+- Player ESP: boxes around visible detected players across the captured monitor.
+- Skeleton: show detected limb keypoints when Player ESP is enabled.
+- Head markers: mark head detections when Player ESP is enabled.
+- Target circle: show the aiming area.
+- Crosshair: center-screen crosshair.
+- Recoil compensation: fixed downward input while holding both mouse buttons, used only when the head controller is not already aiming. This does not remove the game's recoil.
 
 ## Limits
-This is a general human pose model, NOT a Hazmob-trained detector. Actual enemy-head detection and game input compatibility are unverified. It may target teammates and cannot see through walls. Estimated facial landmarks are not the game's exact head hitbox. No confident head means no snap target. It does not change health/ammo, remove spread, automatically fire, or bypass the game's input handling. Downward compensation is an optional fixed mouse pull while LMB is held, not actual recoil removal; it defaults to zero.
+The model is a general human pose detector, not trained specifically on Hazmob. It cannot reliably identify teams, may miss stylized or distant characters, and does not read game memory. ESP shows visible detections, not players behind walls. Memory-based wallhacks, firing through walls, no spread, health and ammo changes are not implemented. A visual overlay cannot override game/server collision or hit validation.
 
-The capture region is centered on the monitor containing the active Chrome/Hazmob window. Use true game fullscreen. Mouse movement is suspended if inference takes more than 200 ms. The 640-pixel pose inference can be slower than the previous model, especially on older CPUs. Captures and inference are local; only dependencies and model weights are downloaded.
+Use full-screen mode so the monitor center matches the crosshair. Aiming and overlays reject stale frames. Input still depends on the game's acceptance of ordinary Windows mouse movement. Fixed defaults and overshoot damping address the observed code issues but do not guarantee a one-frame headshot or perfect calibration for every game sensitivity. Full-monitor detection improves overlay coverage but can reduce small-head detection compared with a center crop.
 
-## Checked
-Six targeted tests cover head confidence, missing/invalid keypoints, target selection, snap movement limits, focus, latency, and stopping. Hidden UI construction and Windows INPUT layout checks passed. No live model inference, screen capture, or mouse input was performed during development. No verified in-game accuracy is claimed.
+## Validation
+24 portable tests cover targeting, lock retention, loss/ambiguity, simulated high-sensitivity settling, updater integrity and release selection. Windows UI checks verify that there are no numeric controls, the version label exists, overlay drawing and cleanup work, and Windows accepts click-through/no-activation/capture-exclusion settings. The UI was visually inspected. No live match accuracy or wall penetration was verified.
 
 ## References
 - Model: https://docs.ultralytics.com/models/yolo11/
-- Head landmark indices: https://docs.ultralytics.com/tasks/pose/
-- Windows relative mouse input: https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput
-Ultralytics packages and model weights are subject to their upstream AGPL-3.0 or enterprise licensing. Review those terms before redistribution.
+- Pose keypoints: https://docs.ultralytics.com/tasks/pose/
+- Overlay capture exclusion: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity
+Ultralytics packages and model weights remain subject to their upstream licensing.
 
 ## Automatic updates from GitHub
 

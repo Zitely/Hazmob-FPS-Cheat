@@ -10,8 +10,9 @@ from ctypes import wintypes as W
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
-from targeting import Detection, head_point, choose_head, movement, may_move
+from targeting import Detection, head_point, StableLock, SettlingController
 
+VERSION = '1.3.0'
 BASE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('HAZMOB_HOME', str(BASE))).resolve()
 os.environ.setdefault('YOLO_CONFIG_DIR', str(DATA / '.model-settings'))
@@ -93,251 +94,275 @@ def send_move(dx, dy):
         raise OSError('Windows did not accept mouse movement. Assistance was paused.')
 
 
+# This source fragment is incorporated into app.py; no extra updater payload file.
+class Overlay:
+    BONES = [(0,1),(0,2),(1,3),(2,4),(5,6),(5,7),(7,9),(6,8),(8,10),
+             (5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)]
+    def __init__(self, parent):
+        self.window = tk.Toplevel(parent)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.configure(bg='#010101')
+        self.window.wm_attributes('-transparentcolor','#010101')
+        self.window.wm_attributes('-topmost',True)
+        self.canvas = tk.Canvas(self.window,bg='#010101',highlightthickness=0,bd=0)
+        self.canvas.pack(fill='both',expand=True)
+        self.window.update_idletasks()
+        u32.GetAncestor.argtypes = [W.HWND, W.UINT]
+        u32.GetAncestor.restype = W.HWND
+        self.hwnd = u32.GetAncestor(self.window.winfo_id(), 2)
+        getter = u32.GetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p)==8 else u32.GetWindowLongW
+        setter = u32.SetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p)==8 else u32.SetWindowLongW
+        getter.argtypes=[W.HWND,ctypes.c_int]; getter.restype=ctypes.c_ssize_t
+        setter.argtypes=[W.HWND,ctypes.c_int,ctypes.c_ssize_t]; setter.restype=ctypes.c_ssize_t
+        setter(self.hwnd,-20,getter(self.hwnd,-20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
+        u32.SetWindowDisplayAffinity.argtypes=[W.HWND,W.DWORD]
+        u32.SetWindowDisplayAffinity.restype=W.BOOL
+        # Exclude our own graphics from the detector input; not a game-access mechanism.
+        self.supported=bool(u32.SetWindowDisplayAffinity(self.hwnd,0x11))
+        self.rect=None
+        self.visible=False
+        u32.SetWindowPos.argtypes=[W.HWND,W.HWND,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,W.UINT]
+        u32.ShowWindow.argtypes=[W.HWND,ctypes.c_int]
+
+    def hide(self):
+        self.canvas.delete('all')
+        if self.visible:
+            u32.ShowWindow(self.hwnd,0)
+            self.visible=False
+
+    def draw(self, packet, cfg):
+        if not self.supported:
+            return
+        rect=packet['rect']
+        left,top,width,height=rect
+        if self.rect != rect:
+            self.window.geometry(f'{width}x{height}+0+0')
+            self.window.update_idletasks()
+            u32.SetWindowPos(self.hwnd,W.HWND(-1),left,top,width,height,0x0010)
+            self.rect=rect
+        self.canvas.delete('all')
+        if cfg['esp']:
+            for box in packet['boxes']:
+                self.canvas.create_rectangle(box.x1,box.y1,box.x2,box.y2,outline='#72e6b4',width=2)
+            if cfg['skeleton']:
+                for points in packet['keypoints']:
+                    for a,b in self.BONES:
+                        if len(points)>max(a,b) and points[a][2]>.6 and points[b][2]>.6:
+                            self.canvas.create_line(points[a][0],points[a][1],points[b][0],points[b][1],fill='#bba6ff',width=2)
+            if cfg['head_markers']:
+                for point,_ in packet['heads']:
+                    if point:
+                        x,y=point
+                        self.canvas.create_oval(x-5,y-5,x+5,y+5,outline='#efc778',width=2)
+        cx,cy=width/2,height/2
+        if cfg['fov_ring']:
+            r=packet['radius']
+            self.canvas.create_oval(cx-r,cy-r,cx+r,cy+r,outline='#8f7cd2',width=1)
+        if cfg['crosshair']:
+            self.canvas.create_line(cx-6,cy,cx+6,cy,fill='white',width=2)
+            self.canvas.create_line(cx,cy-6,cx,cy+6,fill='white',width=2)
+        if packet['target'] and cfg['esp']:
+            x,y=packet['target'][1]
+            self.canvas.create_oval(x-9,y-9,x+9,y+9,outline='#ffb763',width=2)
+        self.canvas.create_text(width-18,height-16,text=f'Hazmob Snap  v{VERSION}',anchor='se',fill='#b7a5ff',font=('Segoe UI',10))
+        if not self.visible:
+            u32.ShowWindow(self.hwnd,4) # Show without activating or stealing Chrome focus.
+            self.visible=True
+
+
 class App:
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title('Hazmob Snap / Experimental')
-        self.root.geometry('960x730')
-        self.root.minsize(820, 710)
-        self.root.configure(bg='#10131c')
-        self.stop = threading.Event()
-        self.lock = threading.Lock()
-        self.config = dict(armed=False, assist=True, require_rmb=False, confidence=.60, radius=200,
-                           gain=1.0, head_confidence=.60, compensation=0)
-        self.updates = queue.Queue(maxsize=2)
-        self.worker_started = False
-        self.ready = False
-        self.previous_keys = {0x77: False, 0x78: False}
-        self.preview_image = None
-        style = ttk.Style()
+        self.root=tk.Tk()
+        self.root.title(f'Hazmob Snap {VERSION}')
+        self.root.geometry('500x800')
+        self.root.minsize(460,780)
+        self.root.configure(bg='#11141d')
+        self.stop=threading.Event()
+        self.lock=threading.Lock()
+        self.config=dict(aimbot=False,esp=False,skeleton=True,head_markers=True,
+                         fov_ring=False,crosshair=False,recoil=False,paused=False)
+        self.events=queue.SimpleQueue()
+        self.frames=queue.Queue(maxsize=1)
+        self.ready=False
+        self.worker_started=False
+        self.previous_keys={0x77:False,0x78:False}
+        self.overlay=Overlay(self.root)
+        self.last_packet=None
+        self.variables={}
+        style=ttk.Style()
         style.theme_use('clam')
-        style.configure('TFrame', background='#10131c')
-        style.configure('TLabel', background='#10131c', foreground='#e9edfa', font=('Segoe UI', 10))
-        style.configure('TCheckbutton', background='#10131c', foreground='#e9edfa', font=('Segoe UI', 10))
-        style.map('TCheckbutton', background=[('active', '#202637')])
-        style.configure('TScale', background='#10131c', troughcolor='#252c40')
-        style.configure('TButton', background='#8974ed', foreground='#ffffff', padding=10, font=('Segoe UI Semibold', 10))
-        style.map('TButton', background=[('active', '#a18dff')])
-        outer = ttk.Frame(self.root, padding=24)
-        outer.pack(fill='both', expand=True)
-        ttk.Label(outer, text='HAZMOB / SNAP', font=('Segoe UI Semibold', 22)).pack(anchor='w')
-        ttk.Label(outer, text='Head-keypoint snap targeting  /  Windows + Chrome  /  Experimental', foreground='#99a7c3').pack(anchor='w', pady=(3, 18))
-        content = ttk.Frame(outer)
-        content.pack(fill='both', expand=True)
-        controls = ttk.Frame(content, width=300)
-        controls.pack(side='left', fill='y', padx=(0, 24))
-        self.start_button = ttk.Button(controls, text='Load detector', command=self.start_worker)
-        self.start_button.pack(fill='x', pady=(0, 12))
-        self.arm_button = ttk.Button(controls, text='Paused / F8 to start', command=self.toggle)
-        self.arm_button.pack(fill='x', pady=(0, 14))
-        self.assist_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(controls, text='Snap aiming enabled', variable=self.assist_var,
-                        command=lambda: self.set_config('assist', self.assist_var.get())).pack(anchor='w', pady=(0, 15))
-        self.hold_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text='Require RMB (optional)', variable=self.hold_var,
-                        command=lambda: self.set_config('require_rmb', self.hold_var.get())).pack(anchor='w', pady=(0, 10))
-        self.slider(controls, 'Detection confidence', 'confidence', .25, .90, .60, 2)
-        self.slider(controls, 'Target radius / screen pixels', 'radius', 40, 300, 200, 0)
-        self.slider(controls, 'Snap sensitivity / mouse calibration', 'gain', .10, 3.0, 1.0, 2)
-        self.slider(controls, 'Head keypoint confidence', 'head_confidence', .35, .90, .60, 2)
-        self.slider(controls, 'Downward compensation / pixels per second', 'compensation', 0, 120, 0, 0)
-        ttk.Label(controls, text='F8  Pause / resume\nF9  Emergency exit\nF8 starts automatic snapping\nOptional RMB requirement available', foreground='#b9c4dc', justify='left').pack(anchor='w', pady=12)
-        right = ttk.Frame(content)
-        right.pack(side='left', fill='both', expand=True)
-        self.preview = tk.Canvas(right, width=480, height=480, bg='#191e2b', highlightthickness=1, highlightbackground='#30384b')
-        self.preview.pack(fill='both', expand=True)
-        self.preview.create_text(240, 220, text='DETECTION PREVIEW\n\nLoad the detector, open Hazmob full-screen,\nthen press F8. Snap aiming is ON; F8 arms it.', fill='#99a7c3', font=('Segoe UI', 12), justify='center')
-        self.status = tk.StringVar(value='Ready to load. First load downloads a general pose-estimation model.')
-        ttk.Label(outer, textvariable=self.status, wraplength=900, foreground='#bdaeff').pack(anchor='w', pady=(16, 6))
-        ttk.Label(outer, text='Not trained for Hazmob. Cannot distinguish teammates or see through walls. Head keypoints must be detected; no body-box fallback.',
-                  foreground='#99a7c3', wraplength=900).pack(anchor='w')
-        self.root.protocol('WM_DELETE_WINDOW', self.close)
-        self.root.after(30, self.poll)
+        style.configure('TFrame',background='#11141d')
+        style.configure('TLabel',background='#11141d',foreground='#e9edfa',font=('Segoe UI',10))
+        style.configure('Switch.TCheckbutton',background='#1b2030',foreground='#e9edfa',font=('Segoe UI Semibold',11),padding=5)
+        style.map('Switch.TCheckbutton',background=[('active','#252c40')])
+        outer=ttk.Frame(self.root,padding=22)
+        outer.pack(fill='both',expand=True)
+        ttk.Label(outer,text='HAZMOB / SNAP',font=('Segoe UI Semibold',23)).pack(anchor='w')
+        ttk.Label(outer,text='Simple controls. Stable targeting.',foreground='#9aabc7').pack(anchor='w',pady=(4,18))
+        self.add_toggle(outer,'Aimbot','Lock onto a confirmed visible head.','aimbot')
+        ttk.Label(outer,text='ON-SCREEN OVERLAY',foreground='#aa96fa',font=('Segoe UI Semibold',9)).pack(anchor='w',pady=(16,8))
+        self.add_toggle(outer,'Player ESP','Boxes around visible detected players.','esp')
+        self.add_toggle(outer,'Skeleton','Show detected body keypoints with ESP.','skeleton')
+        self.add_toggle(outer,'Head markers','Show detected head points with ESP.','head_markers')
+        self.add_toggle(outer,'Target circle','Display the aiming area.','fov_ring')
+        self.add_toggle(outer,'Crosshair','Show a centered crosshair.','crosshair')
+        self.add_toggle(outer,'Recoil compensation','Fixed downward pull while holding both mouse buttons.','recoil')
+        self.status=tk.StringVar(value='Loading detector...')
+        ttk.Label(outer,textvariable=self.status,wraplength=450,foreground='#bba8ff').pack(anchor='w',pady=(14,8))
+        footer=ttk.Frame(outer)
+        footer.pack(side='bottom',fill='x',pady=(10,0))
+        ttk.Label(footer,text='F8 Pause / resume   |   F9 Exit',font=('Segoe UI',9),foreground='#8c9bb5').pack(side='left')
+        ttk.Label(footer,text=f'v{VERSION}',foreground='#bba8ff',font=('Segoe UI Semibold',10)).pack(side='right')
+        self.root.protocol('WM_DELETE_WINDOW',self.close)
+        self.root.after(100,self.start_worker)
+        self.root.after(30,self.poll)
 
-    def set_config(self, key, value):
+    def add_toggle(self,parent,title,subtitle,key):
+        frame=tk.Frame(parent,bg='#1b2030')
+        frame.pack(fill='x',pady=3)
+        variable=tk.BooleanVar(value=self.config[key])
+        self.variables[key]=variable
+        ttk.Checkbutton(frame,text=title,variable=variable,style='Switch.TCheckbutton',
+                        command=lambda:self.set_config(key,variable.get())).pack(anchor='w',fill='x')
+        tk.Label(frame,text=subtitle,bg='#1b2030',fg='#96a6c1',font=('Segoe UI',9),anchor='w').pack(fill='x',padx=11,pady=(0,6))
+
+    def set_config(self,key,value):
         with self.lock:
-            self.config[key] = value
+            self.config[key]=bool(value)
 
-    def slider(self, parent, title, key, low, high, value, digits):
-        value_label = ttk.Label(parent, text=f'{title}: {value:.{digits}f}', font=('Segoe UI', 9))
-        value_label.pack(anchor='w')
-        var = tk.DoubleVar(value=value)
-        def changed(raw):
-            val = float(raw)
-            self.set_config(key, val)
-            value_label.configure(text=f'{title}: {val:.{digits}f}')
-        ttk.Scale(parent, from_=low, to=high, variable=var, command=changed, length=310).pack(fill='x', pady=(3, 11))
+    def snapshot(self):
+        with self.lock:
+            return dict(self.config)
 
-    def publish(self, packet):
-        try:
-            self.updates.put_nowait(packet)
-        except queue.Full:
-            try:
-                self.updates.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.updates.put_nowait(packet)
-            except queue.Full:
-                pass
+    def publish(self,packet):
+        if 'rect' not in packet:
+            self.events.put(packet)
+            return
+        try: self.frames.get_nowait()
+        except queue.Empty: pass
+        try: self.frames.put_nowait(packet)
+        except queue.Full: pass
 
     def start_worker(self):
-        if self.worker_started:
-            return
-        self.worker_started = True
-        self.start_button.configure(state='disabled', text='Loading detector...')
-        threading.Thread(target=self.worker, daemon=True).start()
-
-    def toggle(self):
-        if not self.ready:
-            self.status.set('Load the detector first; wait until it is ready.')
-            return
-        with self.lock:
-            self.config['armed'] = not self.config['armed']
-            armed = self.config['armed']
-        self.arm_button.configure(text='Running / F8 to pause' if armed else 'Paused / F8 to start')
-        if not armed:
-            self.status.set('Paused. No capture or mouse movement.')
+        if self.worker_started or self.stop.is_set(): return
+        self.worker_started=True
+        threading.Thread(target=self.worker,daemon=True).start()
 
     def poll(self):
-        if self.stop.is_set():
-            return
+        if self.stop.is_set(): return
         for code in self.previous_keys:
-            down = key_down(code)
+            down=key_down(code)
             if down and not self.previous_keys[code]:
-                if code == 0x78:
-                    self.close()
-                    return
-                self.toggle()
-            self.previous_keys[code] = down
+                if code==0x78:
+                    self.close(); return
+                cfg=self.snapshot()
+                self.set_config('paused',not cfg['paused'])
+            self.previous_keys[code]=down
         try:
             while True:
-                packet = self.updates.get_nowait()
-                if 'ready' in packet:
-                    self.ready = True
-                    self.start_button.configure(text='Detector ready')
-                if 'error' in packet:
-                    self.set_config('armed', False)
-                    self.arm_button.configure(text='Paused / F8 to start')
-                    self.status.set(packet['error'])
-                    self.worker_started = False
-                    self.ready = False
-                    self.start_button.configure(state='normal', text='Retry detector')
-                elif 'status' in packet:
-                    self.status.set(packet['status'])
-                if 'image' in packet:
-                    from PIL import ImageTk
-                    self.preview_image = ImageTk.PhotoImage(packet['image'])
-                    self.preview.delete('all')
-                    self.preview.create_image(0, 0, anchor='nw', image=self.preview_image)
-        except queue.Empty:
-            pass
-        self.root.after(30, self.poll)
+                event=self.events.get_nowait()
+                if event.get('ready'): self.ready=True
+                if 'error' in event:
+                    self.set_config('paused',True)
+                    self.status.set(event['error'])
+                elif 'status' in event: self.status.set(event['status'])
+        except queue.Empty: pass
+        try: self.last_packet=self.frames.get_nowait()
+        except queue.Empty: pass
+        cfg=self.snapshot()
+        packet=self.last_packet
+        active=self.ready and not cfg['paused'] and any(cfg[k] for k in ('aimbot','esp','fov_ring','crosshair','recoil'))
+        if (active and packet and time.monotonic()-packet['captured']<.22
+            and u32.GetForegroundWindow()==packet['hwnd']):
+            self.overlay.draw(packet,cfg)
+            self.status.set(packet['status'] if self.overlay.supported else packet['status']+' / Overlay unavailable on this Windows capture setup.')
+        else:
+            self.overlay.hide()
+            if self.ready:
+                self.status.set('Paused / F8 to resume' if cfg['paused'] else 'Choose a feature, then return to fullscreen Hazmob in Chrome.' if not active else 'Waiting for a fresh game frame.')
+        self.root.after(30,self.poll)
 
     def worker(self):
         try:
             import mss
             import numpy as np
-            from PIL import Image, ImageDraw
             from ultralytics import YOLO
             import torch
-            torch.set_num_threads(max(1, min(4, (os.cpu_count() or 4) // 2)))
-            self.publish({'status': 'Loading YOLO11n-pose. First run may download its weights; screenshots stay local.'})
-            model = YOLO(str(DATA / 'yolo11n-pose.pt'))
-            model.predict(np.zeros((640,640,3), dtype=np.uint8), imgsz=640, device='cpu', verbose=False)
-            self.publish({'ready': True, 'status': 'Detector ready. Use Hazmob full-screen and press F8. F8 activates head snapping. Uncheck Snap aiming for detection-only testing.'})
-            fractional_recoil = 0.0
-            last = time.monotonic()
-            last_preview = 0.0
+            torch.set_num_threads(max(1,min(4,(os.cpu_count() or 4)//2)))
+            self.publish({'status':'Loading pose detector. First load can download model weights.'})
+            model=YOLO(str(DATA/'yolo11n-pose.pt'))
+            model.predict(np.zeros((640,640,3),dtype=np.uint8),imgsz=640,device='cpu',verbose=False)
+            self.publish({'ready':True,'status':'Ready. Turn on Aimbot or Player ESP.'})
+            tracker=StableLock()
+            controller=SettlingController()
+            generation=0
+            fraction=0.0
+            last=time.monotonic()
+            was_aiming=False
             with mss.mss() as capture:
                 while not self.stop.is_set():
-                    with self.lock:
-                        cfg = dict(self.config)
-                    game = game_window() if cfg['armed'] else None
+                    cfg=self.snapshot()
+                    active=not cfg['paused'] and any(cfg[k] for k in ('aimbot','esp','fov_ring','crosshair','recoil'))
+                    game=game_window() if active else None
                     if not game:
-                        fractional_recoil = 0.0
-                        last = time.monotonic()
-                        if cfg['armed']:
-                            self.publish({'status': 'Waiting for a foreground Chrome tab with Hazmob in its title.'})
-                        self.stop.wait(.15)
-                        continue
-                    hwnd, rect = game
-                    width, height = rect.right-rect.left, rect.bottom-rect.top
-                    size = min(640, width, height)
-                    region = {'left': rect.left+(width-size)//2, 'top': rect.top+(height-size)//2,
-                              'width': size, 'height': size}
-                    started = time.monotonic()
-                    frame = np.asarray(capture.grab(region))[:,:,:3].copy()
-                    results = model.predict(frame, imgsz=640, conf=cfg['confidence'], classes=[0], device='cpu', verbose=False)[0]
-                    rows = results.boxes.data.cpu().numpy() if results.boxes is not None else []
-                    boxes = [Detection(float(r[0]),float(r[1]),float(r[2]),float(r[3]),float(r[4])) for r in rows]
-                    center = (size/2, size/2)
-                    keypoints = (results.keypoints.data.cpu().numpy()
-                                 if results.keypoints is not None else [])
-                    heads = [(head_point(points, box, cfg['head_confidence']), box)
-                             for points, box in zip(keypoints, boxes)]
-                    target = choose_head(heads, center, cfg['radius'])
-                    now = time.monotonic()
-                    age = now-started
-                    dt = min(now-last, .10)
-                    last = now
-                    current = game_window()
-                    with self.lock:
-                        live = dict(self.config)
-                    allowed = may_move(live['armed'], live['assist'], (not live['require_rmb'] or key_down(0x02)),
-                                       current is not None and current[0] == hwnd, age, self.stop.is_set())
-                    if allowed:
-                        dx, dy = movement(target[1], center, live['gain'], max_step=240, deadzone=1) if target else (0,0)
-                        if key_down(0x01):
-                            fractional_recoil += live['compensation']*dt
-                            pull = int(fractional_recoil)
-                            fractional_recoil -= pull
-                            dy += pull
-                        else:
-                            fractional_recoil = 0.0
-                        # Recheck immediately before sending any input.
-                        with self.lock:
-                            current_config = self.config
-                            if (not self.stop.is_set() and current_config['armed'] and current_config['assist']
-                                and u32.GetForegroundWindow() == hwnd
-                                and (not current_config['require_rmb'] or key_down(0x02))):
-                                send_move(dx, dy)
+                        tracker.reset(); controller.reset(); was_aiming=False
+                        fraction=0.0; last=time.monotonic()
+                        self.stop.wait(.10); continue
+                    hwnd,rect=game
+                    width,height=rect.right-rect.left,rect.bottom-rect.top
+                    region={'left':rect.left,'top':rect.top,'width':width,'height':height}
+                    started=time.monotonic()
+                    frame=np.asarray(capture.grab(region))[:,:,:3].copy()
+                    result=model.predict(frame,imgsz=640,conf=.65,classes=[0],device='cpu',verbose=False)[0]
+                    rows=result.boxes.data.cpu().numpy() if result.boxes is not None else []
+                    boxes=[Detection(*map(float,row[:5])) for row in rows]
+                    keypoints=result.keypoints.data.cpu().numpy().tolist() if result.keypoints is not None else []
+                    center=(width/2,height/2)
+                    radius=min(190,height*.22)
+                    heads=[(head_point(points,box,.65),box) for points,box in zip(keypoints,boxes)]
+                    now=time.monotonic()
+                    age=now-started
+                    dt=min(now-last,.10); last=now
+                    live=self.snapshot()
+                    fresh=age<=.20 and u32.GetForegroundWindow()==hwnd and not self.stop.is_set()
+                    aiming=live['aimbot'] and not live['paused'] and fresh
+                    if aiming:
+                        if not was_aiming: tracker.reset(); controller.reset()
+                        target=tracker.update(heads,center,radius,now)
+                        if generation!=tracker.generation:
+                            controller.reset(); generation=tracker.generation
                     else:
-                        fractional_recoil = 0.0
-                    if now-last_preview > .12:
-                        last_preview = now
-                        image = Image.fromarray(frame[:,:,::-1])
-                        draw = ImageDraw.Draw(image)
-                        cx, cy = center
-                        radius = cfg['radius']
-                        draw.ellipse((cx-radius,cy-radius,cx+radius,cy+radius), outline='#9a84ff', width=2)
-                        draw.line((cx-8,cy,cx+8,cy),fill='white',width=1)
-                        draw.line((cx,cy-8,cx,cy+8),fill='white',width=1)
-                        for d in boxes:
-                            draw.rectangle((d.x1,d.y1,d.x2,d.y2),outline='#58dba4',width=2)
-                            draw.text((d.x1,max(0,d.y1-12)),f'person {d.confidence:.0%}',fill='#58dba4')
-                        for point, _ in heads:
-                            if point:
-                                hx,hy=point
-                                draw.ellipse((hx-3,hy-3,hx+3,hy+3),outline='#e9aaff',width=2)
-                        if target:
-                            x,y=target[1]
-                            draw.ellipse((x-5,y-5,x+5,y+5),fill='#ffbf70')
-                        mode = 'Snap active' if allowed and target else 'No confident head' if allowed else 'Waiting for RMB' if live['assist'] else 'Detection only'
-                        latency = ' / too slow for mouse input' if age > .20 else ''
-                        self.publish({'image':image.resize((480,480)), 'status':f'{mode} / {sum(point is not None for point, _ in heads)} head candidates / {age*1000:.0f} ms{latency}'})
-                    self.stop.wait(max(0, .05-(time.monotonic()-started)))
+                        target=None
+                        tracker.reset(); controller.reset()
+                    was_aiming=aiming
+                    dx,dy=controller.step(target[1],center,now) if target else (0,0)
+                    if live['recoil'] and not target and fresh and key_down(0x01) and key_down(0x02):
+                        fraction+=22*dt
+                        pull=int(fraction); fraction-=pull; dy+=pull
+                    else: fraction=0.0
+                    if fresh:
+                        with self.lock:
+                            current=self.config
+                            permitted=(current['aimbot'] and target is not None) or (current['recoil'] and key_down(0x01) and key_down(0x02))
+                            if permitted and not current['paused'] and not self.stop.is_set() and u32.GetForegroundWindow()==hwnd:
+                                send_move(dx,dy)
+                    mode='Head locked' if target else 'Confirming target' if aiming and tracker.box is not None else 'Searching for a confident head' if aiming else 'Overlay active'
+                    if not fresh: mode='Frame too slow / aiming paused'
+                    self.publish({'rect':(rect.left,rect.top,width,height),'hwnd':hwnd,'captured':started,
+                                  'boxes':boxes,'keypoints':keypoints,'heads':heads,'target':target,'radius':radius,
+                                  'status':f'{mode} / {len(boxes)} visible players / {age*1000:.0f} ms'})
+                    self.stop.wait(max(0,.045-(time.monotonic()-started)))
         except Exception as exc:
-            self.set_config('armed',False)
-            self.publish({'error':f'{type(exc).__name__}: {exc}'})
+            self.set_config('paused',True)
+            self.publish({'error':f'{type(exc).__name__}: {exc}. Restart the app to retry.'})
 
     def close(self):
-        self.set_config('armed',False)
+        self.set_config('paused',True)
         self.stop.set()
+        self.overlay.hide()
         self.root.destroy()
 
-    def run(self):
-        self.root.mainloop()
+    def run(self): self.root.mainloop()
 
-if __name__ == '__main__':
-    App().run()
+if __name__=='__main__': App().run()
